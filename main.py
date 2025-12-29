@@ -22,7 +22,7 @@ def find_duplicate_files(folder_path, output_box):
     hashes = {}
     duplicates = {}
 
-    output_box.insert(tk.END, "Tarama başladı...\n\n")
+    output_box.insert(tk.END, "Scan started...\n\n")
     output_box.update()
 
     for root, _, files in os.walk(folder_path):
@@ -42,13 +42,13 @@ def find_duplicate_files(folder_path, output_box):
     duplicates_global = duplicates
 
     if not duplicates:
-        output_box.insert(tk.END, "Kopya dosya bulunamadı.\n")
+        output_box.insert(tk.END, "No duplicate files found.\n")
         return
 
     for i, (file_hash, files) in enumerate(duplicates.items(), start=1):
         output_box.insert(
             tk.END,
-            f"\nKOPYA SETİ {i} (Toplam {len(files)} dosya)\nHash: {file_hash}\n"
+            f"\nDUPLICATE SET {i} (Total {len(files)} files)\nHash: {file_hash}\n"
         )
         for f in files:
             output_box.insert(tk.END, f"  {f}\n")
@@ -58,18 +58,18 @@ def delete_duplicates(output_box):
     global duplicates_global
 
     if not duplicates_global:
-        messagebox.showwarning("Uyarı", "Silinecek kopya bulunamadı.")
+        messagebox.showwarning("Warning", "No duplicates found to delete.")
         return
 
     confirm = messagebox.askyesno(
-        "Onay",
-        "Her kopya grubundan 1 dosya kalacak.\nDiğer tüm kopyalar KALICI olarak silinecek.\nDevam edilsin mi?"
+        "Confirm",
+        "One file will be kept from each duplicate group.\nAll other duplicates will be permanently deleted.\nDo you want to continue?"
     )
 
     if not confirm:
         return
 
-    output_box.insert(tk.END, "\n--- SİLME İŞLEMİ BAŞLADI ---\n")
+    output_box.insert(tk.END, "\n--- DELETE OPERATION STARTED ---\n")
 
     deleted_count = 0
 
@@ -78,17 +78,17 @@ def delete_duplicates(output_box):
         for file_to_delete in files[1:]:
             try:
                 os.remove(file_to_delete)
-                output_box.insert(tk.END, f"SİLİNDİ: {file_to_delete}\n")
+                output_box.insert(tk.END, f"DELETED: {file_to_delete}\n")
                 deleted_count += 1
             except Exception as e:
                 output_box.insert(
                     tk.END,
-                    f"SİLİNEMEDİ: {file_to_delete} | Hata: {e}\n"
+                    f"COULD NOT DELETE: {file_to_delete} | Error: {e}\n"
                 )
 
     output_box.insert(
         tk.END,
-        f"\n--- SİLME TAMAMLANDI | Toplam silinen dosya: {deleted_count} ---\n"
+        f"\n--- DELETE COMPLETED | Total deleted files: {deleted_count} ---\n"
     )
 
     duplicates_global = {}
@@ -103,7 +103,7 @@ def select_folder():
 def start_scan():
     folder = folder_var.get()
     if not folder:
-        messagebox.showwarning("Uyarı", "Lütfen önce bir klasör seçin.")
+        messagebox.showwarning("Warning", "Please select a folder first.")
         return
 
     output_box.delete(1.0, tk.END)
@@ -111,7 +111,7 @@ def start_scan():
 
 # --- TKINTER ARAYÜZ ---
 root = tk.Tk()
-root.title("Kopya Dosya Bulucu & Silici (Hash Tabanlı)")
+root.title("Duplicate File Finder & Remover (Hash-based)")
 root.geometry("950x650")
 
 folder_var = tk.StringVar()
@@ -119,7 +119,7 @@ folder_var = tk.StringVar()
 frame_top = tk.Frame(root)
 frame_top.pack(pady=10)
 
-btn_select = tk.Button(frame_top, text="Dosya Konumu Aç", command=select_folder, width=20)
+btn_select = tk.Button(frame_top, text="Open Folder", command=select_folder, width=20)
 btn_select.pack(side=tk.LEFT, padx=5)
 
 entry_folder = tk.Entry(frame_top, textvariable=folder_var, width=85)
@@ -130,7 +130,7 @@ frame_buttons.pack(pady=10)
 
 btn_start = tk.Button(
     frame_buttons,
-    text="Başla",
+    text="Start",
     command=start_scan,
     width=20,
     bg="#4CAF50",
@@ -140,7 +140,7 @@ btn_start.pack(side=tk.LEFT, padx=10)
 
 btn_delete = tk.Button(
     frame_buttons,
-    text="Kopyaları Sil",
+    text="Delete Duplicates",
     command=lambda: delete_duplicates(output_box),
     width=20,
     bg="#E53935",
