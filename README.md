@@ -71,4 +71,13 @@ This project is licensed under the MIT License. (Change this if you prefer a dif
 
 **Note:** If you'd like additional changes—an English/Turkish bilingual README, screenshots, or more detailed instructions—let me know and I can add them.
 
- 
+## ⚠️ **⛔ WARNING — IMPORTANT**
+
+> 🚨 **THIS APPLICATION PERMANENTLY DELETES FILES (IRREVERSIBLE)** 🚨
+>
+> - **Always BACK UP your data** before using this tool.
+> - **The author is NOT RESPONSIBLE for any data loss.**
+> - **Use this application AT YOUR OWN RISK.**
+>
+> **Recommendation:** First run a scan and carefully review duplicate files before using the delete function.
+
