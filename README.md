@@ -10,7 +10,7 @@ A small Python tool with a simple Tkinter GUI that detects duplicate files insid
 
 - Recursively scans all subfolders in the selected directory.
 - Detects duplicates by hashing file contents using SHA-256.
-- Lists each duplicate set in the GUI output area.
+- Lists each duplicate set in the GUI output area. 
 - After user confirmation, keeps one file from each set and permanently deletes the others.
 - Memory-efficient hashing via chunked reads for large files.
 
