@@ -1,0 +1,4 @@
+# Optional dependencies for enhanced features
+# Install with: pip install -r requirements.txt
+
+Pillow>=10.0.0  # For image preview support

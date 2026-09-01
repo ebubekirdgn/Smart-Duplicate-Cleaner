@@ -1,154 +1,774 @@
 import os
 import hashlib
+import threading
+import queue
+import concurrent.futures
+from pathlib import Path
+from datetime import datetime
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import filedialog, messagebox, ttk
+import json
+import csv
 
-duplicates_global = {}
 
-# Dosya hash hesaplama
-def calculate_hash(file_path, chunk_size=8192):
-    sha256 = hashlib.sha256()
-    try:
-        with open(file_path, "rb") as f:
-            while chunk := f.read(chunk_size):
-                sha256.update(chunk)
-        return sha256.hexdigest()
-    except Exception:
-        return None
+class DuplicateFinder:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Smart Duplicate Cleaner Pro")
+        self.root.geometry("1200x800")
+        self.root.minsize(1000, 700)
 
-# Kopya dosyaları bul
-def find_duplicate_files(folder_path, output_box):
-    global duplicates_global
-    hashes = {}
-    duplicates = {}
+        self.scan_executor = None
+        self.stop_event = threading.Event()
+        self.duplicates = {}
+        self.file_queue = queue.Queue()
+        self.scanned_count = 0
+        self.total_files = 0
+        self.hash_workers = 4
+        self.chunk_size = 65536
+        self.current_group_id = 0
+        self.group_items = {}
 
-    output_box.insert(tk.END, "Scan started...\n\n")
-    output_box.update()
+        self._setup_styles()
+        self._build_ui()
+        self._load_settings()
 
-    for root, _, files in os.walk(folder_path):
-        for file in files:
-            file_path = os.path.join(root, file)
-            file_hash = calculate_hash(file_path)
+    def _setup_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
 
-            if not file_hash:
+        style.configure("Treeview", rowheight=26, font=("Segoe UI", 10))
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        style.map("Treeview", background=[("selected", "#0078d7")], foreground=[("selected", "white")])
+        style.configure("TButton", font=("Segoe UI", 10), padding=8)
+        style.configure("Accent.TButton", background="#0078d7", foreground="white")
+        style.configure("Danger.TButton", background="#d13438", foreground="white")
+        style.configure("Secondary.TButton", background="#e1e1e1", foreground="#333")
+        style.configure("Group.TLabel", font=("Segoe UI", 10, "bold"), foreground="#0078d7")
+        style.configure("File.TLabel", font=("Segoe UI", 10), foreground="#333")
+        style.configure("Status.TLabel", font=("Segoe UI", 9), foreground="#666")
+        style.configure("TLabelframe", font=("Segoe UI", 10, "bold"))
+        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+
+    def _build_ui(self):
+        main_frame = ttk.Frame(self.root, padding=12)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Top bar - Folder selection
+        top_frame = ttk.Frame(main_frame)
+        top_frame.pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Button(top_frame, text="📁 Klasör Seç", command=self._select_folder, width=18).pack(side=tk.LEFT, padx=(0, 8))
+        self.folder_var = tk.StringVar()
+        folder_entry = ttk.Entry(top_frame, textvariable=self.folder_var, width=70, font=("Segoe UI", 10))
+        folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+
+        # Action buttons
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 12))
+
+        self.btn_start = ttk.Button(btn_frame, text="▶ Taramayı Başlat", command=self._start_scan, style="Accent.TButton", width=22)
+        self.btn_start.pack(side=tk.LEFT, padx=4)
+
+        self.btn_stop = ttk.Button(btn_frame, text="⏹ Durdur", command=self._stop_scan, width=16, state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.LEFT, padx=4)
+
+        self.btn_delete = ttk.Button(btn_frame, text="🗑 Seçilileri Sil", command=self._delete_selected, style="Danger.TButton", width=20, state=tk.DISABLED)
+        self.btn_delete.pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(btn_frame, text="☑ Tümünü İşaretle", command=self._select_all_duplicates, width=18).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="☐ Temizle", command=self._clear_selection, width=14).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="📤 Dışa Aktar", command=self._export_results, width=16).pack(side=tk.LEFT, padx=4)
+
+        # Auto-select frame
+        auto_frame = ttk.LabelFrame(main_frame, text="Otomatik Seçim", padding=8)
+        auto_frame.pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Button(auto_frame, text="📅 En Eskiyi Tut", command=lambda: self._auto_select("oldest"), width=16).pack(side=tk.LEFT, padx=4)
+        ttk.Button(auto_frame, text="📅 En Yeniyi Tut", command=lambda: self._auto_select("newest"), width=16).pack(side=tk.LEFT, padx=4)
+        ttk.Button(auto_frame, text="📏 En Kısa Yolu Tut", command=lambda: self._auto_select("shortest"), width=18).pack(side=tk.LEFT, padx=4)
+        ttk.Button(auto_frame, text="📂 Aynı Klasörde Tut", command=lambda: self._auto_select("same_folder"), width=18).pack(side=tk.LEFT, padx=4)
+
+        # Progress bar
+        progress_frame = ttk.Frame(main_frame)
+        progress_frame.pack(fill=tk.X, pady=(0, 8))
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, mode="determinate")
+        self.progress_bar.pack(fill=tk.X)
+
+        self.status_var = tk.StringVar(value="Hazır")
+        ttk.Label(progress_frame, textvariable=self.status_var, style="Status.TLabel").pack(anchor=tk.W, pady=(4, 0))
+
+        # Results - Paned window for tree + preview
+        paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        # Left: Tree view
+        tree_frame = ttk.Frame(paned)
+        paned.add(tree_frame, weight=3)
+
+        columns = ("keep", "name", "path", "size", "modified")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings", selectmode="extended")
+        self.tree.heading("#0", text="Gruplar")
+        self.tree.heading("keep", text="✓")
+        self.tree.heading("name", text="Dosya Adı")
+        self.tree.heading("path", text="Yol")
+        self.tree.heading("size", text="Boyut")
+        self.tree.heading("modified", text="Değiştirilme")
+
+        self.tree.column("#0", width=300, minwidth=200, stretch=True)
+        self.tree.column("keep", width=40, anchor=tk.CENTER, stretch=False)
+        self.tree.column("name", width=200, anchor=tk.W, minwidth=150)
+        self.tree.column("path", width=350, anchor=tk.W, minwidth=200)
+        self.tree.column("size", width=100, anchor=tk.E, stretch=False)
+        self.tree.column("modified", width=150, anchor=tk.CENTER, stretch=False)
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<space>", self._toggle_keep)
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<<TreeviewOpen>>", self._on_group_expand)
+        self.tree.bind("<<TreeviewClose>>", self._on_group_collapse)
+
+        # Right: Preview panel
+        preview_frame = ttk.LabelFrame(paned, text="Önizleme", padding=8)
+        paned.add(preview_frame, weight=1)
+
+        self.preview_label = ttk.Label(preview_frame, text="Dosya seçiniz", style="Status.TLabel", anchor=tk.CENTER)
+        self.preview_label.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        self.preview_canvas = tk.Canvas(preview_frame, bg="#f5f5f5", highlightthickness=0)
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.preview_text = tk.Text(preview_frame, wrap=tk.WORD, font=("Consolas", 9), state=tk.DISABLED, bg="#fafafa")
+        self.preview_text.pack(fill=tk.BOTH, expand=True)
+
+        # Stats
+        self.stats_var = tk.StringVar(value="Dosya: 0 | Kopya Grupları: 0 | Toplam Kopya: 0 | Boşluk: 0 B")
+        ttk.Label(main_frame, textvariable=self.stats_var, font=("Segoe UI", 9), foreground="#444").pack(anchor=tk.W, pady=(8, 0))
+
+        # Context menu
+        self._create_context_menu()
+
+    def _create_context_menu(self):
+        self.context_menu = tk.Menu(self.root, tearoff=0, font=("Segoe UI", 9))
+        self.context_menu.add_command(label="📂 Konumu Aç", command=self._open_file_location)
+        self.context_menu.add_command(label="📄 Özellikler", command=self._show_properties)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="☑ İşaretle", command=lambda: self._toggle_context_item(True))
+        self.context_menu.add_command(label="☐ İşaret Kaldır", command=lambda: self._toggle_context_item(False))
+        self.tree.bind("<Button-3>", self._show_context_menu)
+
+    def _show_context_menu(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def _toggle_context_item(self, check):
+        for item in self.tree.selection():
+            self._set_item_check(item, check)
+
+    def _load_settings(self):
+        try:
+            with open("settings.json", "r", encoding="utf-8") as f:
+                settings = json.load(f)
+                self.hash_workers = settings.get("hash_workers", 4)
+                self.chunk_size = settings.get("chunk_size", 65536)
+                last_folder = settings.get("last_folder", "")
+                if last_folder and os.path.isdir(last_folder):
+                    self.folder_var.set(last_folder)
+        except Exception:
+            pass
+
+    def _save_settings(self):
+        try:
+            settings = {
+                "hash_workers": self.hash_workers,
+                "chunk_size": self.chunk_size,
+                "last_folder": self.folder_var.get()
+            }
+            with open("settings.json", "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+        except Exception:
+            pass
+
+    def _select_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.folder_var.set(folder)
+            self._save_settings()
+
+    def _start_scan(self):
+        folder = self.folder_var.get()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("Uyarı", "Geçerli bir klasör seçin.")
+            return
+
+        self._reset_ui()
+        self.stop_event.clear()
+        self.btn_start.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
+        self.btn_delete.config(state=tk.DISABLED)
+
+        self.scan_executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.hash_workers)
+        self.scan_thread = threading.Thread(target=self._scan_worker, args=(folder,), daemon=True)
+        self.scan_thread.start()
+        self.root.after(100, self._process_queue)
+
+    def _stop_scan(self):
+        self.stop_event.set()
+        self.status_var.set("Durduruluyor...")
+        self.btn_stop.config(state=tk.DISABLED)
+        if self.scan_executor:
+            self.scan_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _reset_ui(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.duplicates.clear()
+        self.group_items.clear()
+        self.current_group_id = 0
+        self.scanned_count = 0
+        self.total_files = 0
+        self.progress_var.set(0)
+        self.status_var.set("Taranıyor...")
+        self.stats_var.set("Dosya: 0 | Kopya Grupları: 0 | Toplam Kopya: 0 | Boşluk: 0 B")
+        self._clear_preview()
+
+    def _scan_worker(self, folder):
+        try:
+            # First pass: collect files by size (fast, single-threaded)
+            size_map = {}
+            file_count = 0
+            for root, _, files in os.walk(folder):
+                if self.stop_event.is_set():
+                    self.file_queue.put(("stopped", None))
+                    return
+                for f in files:
+                    path = os.path.join(root, f)
+                    try:
+                        size = os.path.getsize(path)
+                        if size == 0:
+                            continue
+                        size_map.setdefault(size, []).append(path)
+                        file_count += 1
+                    except OSError:
+                        continue
+
+            # Filter sizes with multiple files
+            candidate_groups = {s: paths for s, paths in size_map.items() if len(paths) > 1}
+            self.total_files = sum(len(p) for p in candidate_groups.values())
+            self.file_queue.put(("total", self.total_files, file_count))
+
+            # Second pass: hash candidates in parallel
+            hashes = {}
+            pending = []
+
+            for size, paths in candidate_groups.items():
+                for path in paths:
+                    if self.stop_event.is_set():
+                        self.file_queue.put(("stopped", None))
+                        return
+                    pending.append((size, path))
+
+            # Process in batches for progress updates
+            batch_size = max(1, len(pending) // 100)
+            futures = {}
+
+            for size, path in pending:
+                if self.stop_event.is_set():
+                    break
+                future = self.scan_executor.submit(self._calculate_hash, path)
+                futures[future] = (size, path)
+
+            completed = 0
+            for future in concurrent.futures.as_completed(futures):
+                if self.stop_event.is_set():
+                    break
+                size, path = futures[future]
+                try:
+                    file_hash = future.result()
+                    if file_hash:
+                        key = (size, file_hash)
+                        if key in hashes:
+                            hashes[key].append(path)
+                        else:
+                            hashes[key] = [path]
+                except Exception:
+                    pass
+
+                completed += 1
+                if completed % max(1, batch_size) == 0 or completed == self.total_files:
+                    self.scanned_count = completed
+                    self.file_queue.put(("progress", completed))
+
+            # Collect duplicates
+            self.duplicates = {k: v for k, v in hashes.items() if len(v) > 1}
+            self.file_queue.put(("done", len(self.duplicates)))
+
+        except Exception as e:
+            self.file_queue.put(("error", str(e)))
+        finally:
+            if self.scan_executor:
+                self.scan_executor.shutdown(wait=True)
+
+    def _calculate_hash(self, filepath, chunk_size=None):
+        if chunk_size is None:
+            chunk_size = self.chunk_size
+        sha256 = hashlib.sha256()
+        try:
+            with open(filepath, "rb") as f:
+                while chunk := f.read(chunk_size):
+                    sha256.update(chunk)
+            return sha256.hexdigest()
+        except Exception:
+            return None
+
+    def _process_queue(self):
+        try:
+            while True:
+                msg = self.file_queue.get_nowait()
+                msg_type = msg[0]
+
+                if msg_type == "total":
+                    self.total_files = msg[1]
+                    self.progress_bar.config(maximum=msg[1])
+                    self.status_var.set(f"Bulunan dosya: {msg[2]} | Taranacak: {msg[1]}")
+                elif msg_type == "progress":
+                    self.scanned_count = msg[1]
+                    self.progress_var.set(msg[1])
+                    pct = (msg[1] / self.total_files * 100) if self.total_files else 0
+                    self.status_var.set(f"Taranıyor: {msg[1]}/{self.total_files} ({pct:.1f}%)")
+                elif msg_type == "done":
+                    self._populate_tree(msg[1])
+                    self.btn_start.config(state=tk.NORMAL)
+                    self.btn_stop.config(state=tk.DISABLED)
+                    if msg[1] > 0:
+                        self.btn_delete.config(state=tk.NORMAL)
+                    return
+                elif msg_type == "stopped":
+                    self.status_var.set("Durduruldu")
+                    self.btn_start.config(state=tk.NORMAL)
+                    self.btn_stop.config(state=tk.DISABLED)
+                    return
+                elif msg_type == "error":
+                    messagebox.showerror("Hata", f"Tarama hatası: {msg[1]}")
+                    self.btn_start.config(state=tk.NORMAL)
+                    self.btn_stop.config(state=tk.DISABLED)
+                    return
+        except queue.Empty:
+            pass
+
+        if self.scan_thread and self.scan_thread.is_alive():
+            self.root.after(100, self._process_queue)
+
+    def _populate_tree(self, group_count):
+        total_dupes = 0
+        total_wasted = 0
+
+        # Sort groups by wasted space (descending)
+        sorted_groups = sorted(
+            self.duplicates.items(),
+            key=lambda x: (len(x[1]) - 1) * os.path.getsize(x[1][0]),
+            reverse=True
+        )
+
+        for (size, fhash), paths in sorted_groups:
+            if self.stop_event.is_set():
+                break
+
+            group_size = os.path.getsize(paths[0])
+            wasted = group_size * (len(paths) - 1)
+            total_wasted += wasted
+            total_dupes += len(paths) - 1
+
+            group_id = f"group_{self.current_group_id}"
+            self.current_group_id += 1
+
+            # Group header
+            group_text = f"{len(paths)} dosya · {self._format_size(group_size)} each · Boşluk: {self._format_size(wasted)}"
+            group_item = self.tree.insert("", tk.END, iid=group_id, text=group_text, open=True, tags=("group",))
+            self.group_items[group_id] = paths
+
+            # Files in group (lazy loaded on expand)
+            self.tree.insert(group_id, tk.END, iid=f"{group_id}_placeholder", text="Yükleniyor...")
+
+        self.stats_var.set(f"Dosya: {self.scanned_count} | Kopya Grupları: {group_count} | Toplam Kopya: {total_dupes} | Boşluk: {self._format_size(total_wasted)}")
+        self.status_var.set(f"Tamamlandı - {group_count} kopya grubu bulundu")
+
+    def _on_group_expand(self, event):
+        item = self.tree.focus()
+        if item.startswith("group_"):
+            children = self.tree.get_children(item)
+            if len(children) == 1 and children[0].endswith("_placeholder"):
+                self.tree.delete(children[0])
+                self._load_group_files(item)
+
+    def _load_group_files(self, group_id):
+        paths = self.group_items.get(group_id, [])
+        for i, path in enumerate(paths):
+            try:
+                stat = os.stat(path)
+                size_str = self._format_size(stat.st_size)
+                mod_str = self._format_time(stat.st_mtime)
+                name = os.path.basename(path)
+                keep = "☑" if i == 0 else "☐"
+                file_id = f"{group_id}_file_{i}"
+                self.tree.insert(group_id, tk.END, iid=file_id, text="", values=(keep, name, path, size_str, mod_str), tags=("file",))
+            except OSError:
                 continue
 
-            if file_hash in hashes:
-                duplicates.setdefault(file_hash, [hashes[file_hash]])
-                duplicates[file_hash].append(file_path)
+    def _on_group_collapse(self, event):
+        pass
+
+    def _format_size(self, bytes_):
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_ < 1024:
+                return f"{bytes_:.1f} {unit}"
+            bytes_ /= 1024
+        return f"{bytes_:.1f} PB"
+
+    def _format_time(self, timestamp):
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+
+    def _on_tree_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region == "cell":
+            col = self.tree.identify_column(event.x)
+            if col == "#1":
+                item = self.tree.identify_row(event.y)
+                if item and not item.startswith("group_"):
+                    self._toggle_keep_item(item)
+        elif region == "tree":
+            item = self.tree.identify_row(event.y)
+            if item and item.startswith("group_"):
+                self._show_group_preview(item)
+
+    def _toggle_keep(self, event):
+        item = self.tree.focus()
+        if item and not item.startswith("group_"):
+            self._toggle_keep_item(item)
+
+    def _toggle_keep_item(self, item):
+        vals = list(self.tree.item(item, "values"))
+        if vals:
+            vals[0] = "☐" if vals[0] == "☑" else "☑"
+            self.tree.item(item, values=vals)
+            self._show_file_preview(item)
+
+    def _set_item_check(self, item, check):
+        if not item.startswith("group_"):
+            vals = list(self.tree.item(item, "values"))
+            if vals:
+                vals[0] = "☑" if check else "☐"
+                self.tree.item(item, values=vals)
+
+    def _select_all_duplicates(self):
+        for item in self.tree.get_children():
+            self._check_all_in_group(item, True)
+
+    def _check_all_in_group(self, group_id, check):
+        for child in self.tree.get_children(group_id):
+            self._set_item_check(child, check)
+
+    def _clear_selection(self):
+        for item in self.tree.get_children():
+            self._check_all_in_group(item, False)
+
+    def _auto_select(self, mode):
+        for group_id in self.tree.get_children():
+            if not group_id.startswith("group_"):
+                continue
+            children = self.tree.get_children(group_id)
+            if not children:
+                continue
+
+            files_info = []
+            for child in children:
+                vals = self.tree.item(child, "values")
+                if not vals:
+                    continue
+                path = vals[2]
+                try:
+                    stat = os.stat(path)
+                    files_info.append({
+                        "item": child,
+                        "path": path,
+                        "mtime": stat.st_mtime,
+                        "path_len": len(path)
+                    })
+                except OSError:
+                    continue
+
+            if not files_info:
+                continue
+
+            if mode == "oldest":
+                keep_item = min(files_info, key=lambda x: x["mtime"])["item"]
+            elif mode == "newest":
+                keep_item = max(files_info, key=lambda x: x["mtime"])["item"]
+            elif mode == "shortest":
+                keep_item = min(files_info, key=lambda x: x["path_len"])["item"]
+            elif mode == "same_folder":
+                group_path = os.path.dirname(files_info[0]["path"])
+                same_folder = [f for f in files_info if os.path.dirname(f["path"]) == group_path]
+                keep_item = same_folder[0]["item"] if same_folder else files_info[0]["item"]
             else:
-                hashes[file_hash] = file_path
+                keep_item = files_info[0]["item"]
 
-    duplicates_global = duplicates
+            for f in files_info:
+                self._set_item_check(f["item"], f["item"] == keep_item)
 
-    if not duplicates:
-        output_box.insert(tk.END, "No duplicate files found.\n")
-        return
+    def _on_double_click(self, event):
+        item = self.tree.focus()
+        if item and not item.startswith("group_"):
+            self._open_file_location()
 
-    for i, (file_hash, files) in enumerate(duplicates.items(), start=1):
-        output_box.insert(
-            tk.END,
-            f"\nDUPLICATE SET {i} (Total {len(files)} files)\nHash: {file_hash}\n"
+    def _show_file_preview(self, item):
+        vals = self.tree.item(item, "values")
+        if not vals:
+            return
+        path = vals[2]
+        self._load_preview(path)
+
+    def _show_group_preview(self, group_id):
+        paths = self.group_items.get(group_id, [])
+        if paths:
+            self._load_preview(paths[0])
+
+    def _load_preview(self, path):
+        self._clear_preview()
+        self.preview_label.config(text=os.path.basename(path))
+
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext in ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'):
+                self._preview_image(path)
+            elif ext in ('.txt', '.log', '.md', '.py', '.js', '.json', '.xml', '.csv', '.ini', '.cfg'):
+                self._preview_text(path)
+            else:
+                self.preview_label.config(text=f"{os.path.basename(path)}\n({self._format_size(os.path.getsize(path))}) - Önizleme desteklenmiyor")
+        except Exception as e:
+            self.preview_label.config(text=f"Önizleme hatası: {e}")
+
+    def _preview_image(self, path):
+        self.preview_text.pack_forget()
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            canvas_w = self.preview_canvas.winfo_width() or 300
+            canvas_h = self.preview_canvas.winfo_height() or 300
+            img.thumbnail((canvas_w - 20, canvas_h - 20), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_image(canvas_w // 2, canvas_h // 2, image=photo, anchor=tk.CENTER)
+            self.preview_canvas.image = photo
+        except Exception:
+            self.preview_canvas.pack_forget()
+            self.preview_text.pack(fill=tk.BOTH, expand=True)
+            self.preview_text.config(state=tk.NORMAL)
+            self.preview_text.delete(1.0, tk.END)
+            self.preview_text.insert(tk.END, f"Görsel yüklenemedi: {path}")
+            self.preview_text.config(state=tk.DISABLED)
+
+    def _preview_text(self, path):
+        self.preview_canvas.pack_forget()
+        self.preview_text.pack(fill=tk.BOTH, expand=True)
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read(5000)
+            self.preview_text.config(state=tk.NORMAL)
+            self.preview_text.delete(1.0, tk.END)
+            self.preview_text.insert(tk.END, content)
+            if len(content) >= 5000:
+                self.preview_text.insert(tk.END, "\n\n... (kesildi)")
+            self.preview_text.config(state=tk.DISABLED)
+        except Exception as e:
+            self.preview_text.config(state=tk.NORMAL)
+            self.preview_text.delete(1.0, tk.END)
+            self.preview_text.insert(tk.END, f"Metin yüklenemedi: {e}")
+            self.preview_text.config(state=tk.DISABLED)
+
+    def _clear_preview(self):
+        self.preview_canvas.delete("all")
+        self.preview_canvas.image = None
+        self.preview_canvas.pack_forget()
+        self.preview_text.pack_forget()
+        self.preview_label.config(text="Dosya seçiniz")
+
+    def _open_file_location(self):
+        item = self.tree.focus()
+        if not item or item.startswith("group_"):
+            return
+        vals = self.tree.item(item, "values")
+        if not vals:
+            return
+        path = vals[2]
+        folder = os.path.dirname(path)
+        try:
+            if os.name == 'nt':
+                os.startfile(folder)
+            else:
+                import subprocess
+                subprocess.run(['xdg-open', folder])
+        except Exception as e:
+            messagebox.showerror("Hata", f"Klasör açılamadı: {e}")
+
+    def _show_properties(self):
+        item = self.tree.focus()
+        if not item or item.startswith("group_"):
+            return
+        vals = self.tree.item(item, "values")
+        if not vals:
+            return
+        path = vals[2]
+        try:
+            stat = os.stat(path)
+            info = f"Dosya: {os.path.basename(path)}\n"
+            info += f"Yol: {path}\n"
+            info += f"Boyut: {self._format_size(stat.st_size)} ({stat.st_size} bayt)\n"
+            info += f"Oluşturulma: {self._format_time(stat.st_ctime)}\n"
+            info += f"Değiştirilme: {self._format_time(stat.st_mtime)}\n"
+            info += f"Erişim: {self._format_time(stat.st_atime)}"
+            messagebox.showinfo("Dosya Özellikleri", info)
+        except Exception as e:
+            messagebox.showerror("Hata", f"Özellikler alınamadı: {e}")
+
+    def _delete_selected(self):
+        to_delete = []
+        for group_id in self.tree.get_children():
+            if not group_id.startswith("group_"):
+                continue
+            for child in self.tree.get_children(group_id):
+                vals = self.tree.item(child, "values")
+                if vals and vals[0] == "☑":
+                    to_delete.append((child, vals[2]))
+
+        if not to_delete:
+            messagebox.showinfo("Bilgi", "Silinecek dosya seçilmedi.")
+            return
+
+        confirm = messagebox.askyesno(
+            "Onay",
+            f"{len(to_delete)} dosya kalıcı olarak silinecek.\nBu işlem GERİ ALINAMAZ. Devam etmek istiyor musunuz?",
+            icon="warning"
         )
-        for f in files:
-            output_box.insert(tk.END, f"  {f}\n")
+        if not confirm:
+            return
 
-# Kopyaları sil
-def delete_duplicates(output_box):
-    global duplicates_global
-
-    if not duplicates_global:
-        messagebox.showwarning("Warning", "No duplicates found to delete.")
-        return
-
-    confirm = messagebox.askyesno(
-        "Confirm",
-        "One file will be kept from each duplicate group.\nAll other duplicates will be permanently deleted.\nDo you want to continue?"
-    )
-
-    if not confirm:
-        return
-
-    output_box.insert(tk.END, "\n--- DELETE OPERATION STARTED ---\n")
-
-    deleted_count = 0
-
-    for file_hash, files in duplicates_global.items():
-        # İlk dosya kalsın, diğerleri silinsin
-        for file_to_delete in files[1:]:
+        deleted = 0
+        errors = 0
+        for item_id, path in to_delete:
             try:
-                os.remove(file_to_delete)
-                output_box.insert(tk.END, f"DELETED: {file_to_delete}\n")
-                deleted_count += 1
+                os.remove(path)
+                deleted += 1
+                self.tree.delete(item_id)
             except Exception as e:
-                output_box.insert(
-                    tk.END,
-                    f"COULD NOT DELETE: {file_to_delete} | Error: {e}\n"
-                )
+                errors += 1
+                messagebox.showerror("Hata", f"Silinemedi: {path}\n{e}")
 
-    output_box.insert(
-        tk.END,
-        f"\n--- DELETE COMPLETED | Total deleted files: {deleted_count} ---\n"
-    )
+        # Remove empty groups
+        for group_id in self.tree.get_children():
+            if not self.tree.get_children(group_id):
+                self.tree.delete(group_id)
 
-    duplicates_global = {}
+        messagebox.showinfo("Tamam", f"Silinen: {deleted}\nHata: {errors}")
+        self._update_stats_after_delete()
 
-# Klasör seç
-def select_folder():
-    folder = filedialog.askdirectory()
-    if folder:
-        folder_var.set(folder)
+    def _update_stats_after_delete(self):
+        remaining = 0
+        groups = 0
+        dupe_count = 0
+        wasted = 0
+        for group_id in self.tree.get_children():
+            if not group_id.startswith("group_"):
+                continue
+            groups += 1
+            children = self.tree.get_children(group_id)
+            if len(children) > 1:
+                dupe_count += len(children) - 1
+                try:
+                    first = self.tree.item(children[0], "values")
+                    if first:
+                        size = os.path.getsize(first[2])
+                        wasted += size * (len(children) - 1)
+                except Exception:
+                    pass
+            remaining += len(children)
+        self.stats_var.set(f"Dosya: {remaining} | Kopya Grupları: {groups} | Toplam Kopya: {dupe_count} | Boşluk: {self._format_size(wasted)}")
 
-# Başlat
-def start_scan():
-    folder = folder_var.get()
-    if not folder:
-        messagebox.showwarning("Warning", "Please select a folder first.")
-        return
+    def _export_results(self):
+        if not self.duplicates:
+            messagebox.showinfo("Bilgi", "Dışa aktarılacak veri yok.")
+            return
 
-    output_box.delete(1.0, tk.END)
-    find_duplicate_files(folder, output_box)
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("Tüm Dosyalar", "*.*")]
+        )
+        if not file_path:
+            return
 
-# --- TKINTER ARAYÜZ ---
-root = tk.Tk()
-root.title("Duplicate File Finder & Remover (Hash-based)")
-root.geometry("950x650")
+        try:
+            if file_path.endswith(".csv"):
+                with open(file_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Grup", "Dosya Adı", "Yol", "Boyut", "Değiştirilme", "Sakla"])
+                    for group_id in self.tree.get_children():
+                        if not group_id.startswith("group_"):
+                            continue
+                        group_text = self.tree.item(group_id, "text")
+                        for child in self.tree.get_children(group_id):
+                            vals = self.tree.item(child, "values")
+                            if vals:
+                                writer.writerow([group_text, vals[1], vals[2], vals[3], vals[4], vals[0]])
+            else:
+                data = []
+                for group_id in self.tree.get_children():
+                    if not group_id.startswith("group_"):
+                        continue
+                    group_text = self.tree.item(group_id, "text")
+                    files = []
+                    for child in self.tree.get_children(group_id):
+                        vals = self.tree.item(child, "values")
+                        if vals:
+                            files.append({
+                                "name": vals[1],
+                                "path": vals[2],
+                                "size": vals[3],
+                                "modified": vals[4],
+                                "keep": vals[0] == "☑"
+                            })
+                    data.append({"group": group_text, "files": files})
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
 
-folder_var = tk.StringVar()
+            messagebox.showinfo("Başarılı", f"Sonuçlar kaydedildi:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Dışa aktarma başarısız: {e}")
 
-frame_top = tk.Frame(root)
-frame_top.pack(pady=10)
 
-btn_select = tk.Button(frame_top, text="Open Folder", command=select_folder, width=20)
-btn_select.pack(side=tk.LEFT, padx=5)
+def main():
+    root = tk.Tk()
+    try:
+        root.iconbitmap(default="")
+    except Exception:
+        pass
+    app = DuplicateFinder(root)
+    root.mainloop()
 
-entry_folder = tk.Entry(frame_top, textvariable=folder_var, width=85)
-entry_folder.pack(side=tk.LEFT, padx=5)
 
-frame_buttons = tk.Frame(root)
-frame_buttons.pack(pady=10)
-
-btn_start = tk.Button(
-    frame_buttons,
-    text="Start",
-    command=start_scan,
-    width=20,
-    bg="#4CAF50",
-    fg="white"
-)
-btn_start.pack(side=tk.LEFT, padx=10)
-
-btn_delete = tk.Button(
-    frame_buttons,
-    text="Delete Duplicates",
-    command=lambda: delete_duplicates(output_box),
-    width=20,
-    bg="#E53935",
-    fg="white"
-)
-btn_delete.pack(side=tk.LEFT, padx=10)
-
-output_box = scrolledtext.ScrolledText(root, wrap=tk.WORD, width=120, height=30)
-output_box.pack(padx=10, pady=10)
-
-root.mainloop()
+if __name__ == "__main__":
+    main()
