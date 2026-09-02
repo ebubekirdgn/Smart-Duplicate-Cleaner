@@ -183,8 +183,12 @@ class DuplicateFinder:
         try:
             with open("settings.json", "r", encoding="utf-8") as f:
                 settings = json.load(f)
-                self.hash_workers = settings.get("hash_workers", 4)
-                self.chunk_size = settings.get("chunk_size", 65536)
+                hash_workers = settings.get("hash_workers", 4)
+                chunk_size = settings.get("chunk_size", 65536)
+                if isinstance(hash_workers, int) and not isinstance(hash_workers, bool) and 1 <= hash_workers <= 32:
+                    self.hash_workers = hash_workers
+                if isinstance(chunk_size, int) and not isinstance(chunk_size, bool) and 4096 <= chunk_size <= 16 * 1024 * 1024:
+                    self.chunk_size = chunk_size
                 last_folder = settings.get("last_folder", "")
                 if last_folder and os.path.isdir(last_folder):
                     self.folder_var.set(last_folder)
@@ -221,7 +225,6 @@ class DuplicateFinder:
         self.btn_stop.config(state=tk.NORMAL)
         self.btn_delete.config(state=tk.DISABLED)
 
-        self.scan_executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.hash_workers)
         self.scan_thread = threading.Thread(target=self._scan_worker, args=(folder,), daemon=True)
         self.scan_thread.start()
         self.root.after(100, self._process_queue)
@@ -230,8 +233,6 @@ class DuplicateFinder:
         self.stop_event.set()
         self.status_var.set("Durduruluyor...")
         self.btn_stop.config(state=tk.DISABLED)
-        if self.scan_executor:
-            self.scan_executor.shutdown(wait=False, cancel_futures=True)
 
     def _reset_ui(self):
         for item in self.tree.get_children():
@@ -247,6 +248,9 @@ class DuplicateFinder:
         self._clear_preview()
 
     def _scan_worker(self, folder):
+        terminal_message = None
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.hash_workers)
+        self.scan_executor = executor
         try:
             # First pass: collect files by size (fast, single-threaded)
             size_map = {}
@@ -266,62 +270,118 @@ class DuplicateFinder:
                     except OSError:
                         continue
 
-            # Filter sizes with multiple files
-            candidate_groups = {s: paths for s, paths in size_map.items() if len(paths) > 1}
-            self.total_files = sum(len(p) for p in candidate_groups.values())
+            self.total_files = sum(len(paths) for paths in size_map.values() if len(paths) > 1)
             self.file_queue.put(("total", self.total_files, file_count))
 
-            # Second pass: hash candidates in parallel
+            # A small first/last-block hash eliminates most candidates before
+            # their full contents need to be read.
             hashes = {}
-            pending = []
-
-            for size, paths in candidate_groups.items():
-                for path in paths:
-                    if self.stop_event.is_set():
-                        self.file_queue.put(("stopped", None))
-                        return
-                    pending.append((size, path))
-
-            # Process in batches for progress updates
-            batch_size = max(1, len(pending) // 100)
-            futures = {}
-
-            for size, path in pending:
-                if self.stop_event.is_set():
-                    break
-                future = self.scan_executor.submit(self._calculate_hash, path)
-                futures[future] = (size, path)
-
             completed = 0
-            for future in concurrent.futures.as_completed(futures):
-                if self.stop_event.is_set():
-                    break
-                size, path = futures[future]
-                try:
-                    file_hash = future.result()
-                    if file_hash:
-                        key = (size, file_hash)
-                        if key in hashes:
-                            hashes[key].append(path)
-                        else:
-                            hashes[key] = [path]
-                except Exception:
-                    pass
+            last_reported = 0
+            progress_step = max(1, self.total_files // 100)
 
-                completed += 1
-                if completed % max(1, batch_size) == 0 or completed == self.total_files:
+            def report_progress(increment):
+                nonlocal completed, last_reported
+                completed += increment
+                if completed - last_reported >= progress_step or completed == self.total_files:
+                    last_reported = completed
                     self.scanned_count = completed
                     self.file_queue.put(("progress", completed))
 
+            for size, paths in size_map.items():
+                if len(paths) < 2:
+                    continue
+                if self.stop_event.is_set():
+                    terminal_message = ("stopped", None)
+                    return
+
+                sample_groups = {}
+                failed_samples = 0
+                for path, sample_hash in self._bounded_hash(executor, paths, self._calculate_sample_hash):
+                    if sample_hash:
+                        sample_groups.setdefault(sample_hash, []).append(path)
+                    else:
+                        failed_samples += 1
+                if self.stop_event.is_set():
+                    terminal_message = ("stopped", None)
+                    return
+                report_progress(failed_samples)
+
+                full_hash_paths = []
+                for sample_paths in sample_groups.values():
+                    if len(sample_paths) > 1:
+                        full_hash_paths.extend(sample_paths)
+                    else:
+                        report_progress(1)
+
+                for path, file_hash in self._bounded_hash(executor, full_hash_paths, self._calculate_hash):
+                    if file_hash:
+                        hashes.setdefault((size, file_hash), []).append(path)
+                    report_progress(1)
+                if self.stop_event.is_set():
+                    terminal_message = ("stopped", None)
+                    return
+
             # Collect duplicates
             self.duplicates = {k: v for k, v in hashes.items() if len(v) > 1}
-            self.file_queue.put(("done", len(self.duplicates)))
+            terminal_message = ("done", len(self.duplicates))
 
         except Exception as e:
-            self.file_queue.put(("error", str(e)))
+            terminal_message = ("error", str(e))
         finally:
-            if self.scan_executor:
-                self.scan_executor.shutdown(wait=True)
+            executor.shutdown(wait=True)
+            if self.scan_executor is executor:
+                self.scan_executor = None
+            if terminal_message:
+                self.file_queue.put(terminal_message)
+
+    def _bounded_hash(self, executor, paths, hash_function):
+        paths = iter(paths)
+        futures = {}
+        max_pending = max(self.hash_workers, self.hash_workers * 4)
+
+        def submit_next():
+            if self.stop_event.is_set():
+                return False
+            try:
+                path = next(paths)
+            except StopIteration:
+                return False
+            futures[executor.submit(hash_function, path)] = path
+            return True
+
+        for _ in range(max_pending):
+            if not submit_next():
+                break
+
+        while futures:
+            done, _ = concurrent.futures.wait(
+                futures, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for future in done:
+                path = futures.pop(future)
+                try:
+                    result = future.result()
+                except Exception:
+                    result = None
+                yield path, result
+                submit_next()
+
+    def _calculate_sample_hash(self, filepath, sample_size=65536):
+        sha256 = hashlib.sha256()
+        try:
+            with open(filepath, "rb") as f:
+                initial = os.fstat(f.fileno())
+                sha256.update(f.read(sample_size))
+                if initial.st_size > sample_size:
+                    f.seek(max(sample_size, initial.st_size - sample_size))
+                    sha256.update(f.read(sample_size))
+                final = os.fstat(f.fileno())
+            if initial.st_size != final.st_size or initial.st_mtime_ns != final.st_mtime_ns:
+                return None
+            return sha256.hexdigest()
+        except (OSError, ValueError):
+            return None
 
     def _calculate_hash(self, filepath, chunk_size=None):
         if chunk_size is None:
@@ -329,10 +389,16 @@ class DuplicateFinder:
         sha256 = hashlib.sha256()
         try:
             with open(filepath, "rb") as f:
+                initial = os.fstat(f.fileno())
                 while chunk := f.read(chunk_size):
+                    if self.stop_event.is_set():
+                        return None
                     sha256.update(chunk)
+                final = os.fstat(f.fileno())
+            if initial.st_size != final.st_size or initial.st_mtime_ns != final.st_mtime_ns:
+                return None
             return sha256.hexdigest()
-        except Exception:
+        except (OSError, ValueError):
             return None
 
     def _process_queue(self):
@@ -380,7 +446,7 @@ class DuplicateFinder:
         # Sort groups by wasted space (descending)
         sorted_groups = sorted(
             self.duplicates.items(),
-            key=lambda x: (len(x[1]) - 1) * os.path.getsize(x[1][0]),
+            key=lambda x: (len(x[1]) - 1) * x[0][0],
             reverse=True
         )
 
@@ -388,7 +454,7 @@ class DuplicateFinder:
             if self.stop_event.is_set():
                 break
 
-            group_size = os.path.getsize(paths[0])
+            group_size = size
             wasted = group_size * (len(paths) - 1)
             total_wasted += wasted
             total_dupes += len(paths) - 1

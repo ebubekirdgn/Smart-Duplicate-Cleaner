@@ -22,7 +22,7 @@
 
 | Sorun | Çözümümüz |
 |-------|-----------|
-| 🐌 Büyük klasörlerde tarama saatler sürer | **Paralel hash** (4-8 thread) + **boyut ön filtresi** |
+| 🐌 Büyük klasörlerde tarama saatler sürer | **Kademeli paralel hash** + **boyut ve örnek içerik ön filtresi** |
 | 🖥️ Tarama sırasında arayüz donar | **ThreadPoolExecutor** + **batch progress** + **lazy loading** |
 | 📋 Binlerce kopya karışık listelenir | **Expandable grup yapısı** + **boşluk tasarrufu sıralaması** |
 | 👁️ Dosya ne olduğunu bilmeden silmek risklidir | **Sağ panelde anlık önizleme** (resim/metin) |
@@ -206,11 +206,13 @@ graph TD
 
 1. **Boyut Ön Filtresi** — `os.walk()` ile tek seferde tüm dosyalar boyutlandırılır. Sadece birden fazla dosyaya sahip boyutlar "aday" olur. Bu, %90+ dosyayı hashleme maliyetinden kurtarır.
 
-2. **Paralel SHA-256** — Aday dosyalar `ThreadPoolExecutor(max_workers=N)` ile işlenir. Her dosya 64KB chunk'larda okunur (bellek dostu).
+2. **Kademeli Paralel SHA-256** — Aynı boyuttaki dosyaların önce ilk ve son 64KB blokları karşılaştırılır. Yalnız bu örnek hash'i eşleşen dosyaların tamamı `ThreadPoolExecutor(max_workers=N)` ile okunur.
 
-3. **Grup Sıralaması** — Gruplar `boşluk_tasarrufu = (dosya_sayısı - 1) * dosya_boyutu` formülüyle **büyükten küçüğe** sıralanır. En üstte en çok yer kazandırıcı gruplar olur.
+3. **Sınırlı İş Kuyruğu** — Aynı anda en fazla worker sayısının dört katı hash görevi bekletilir. Böylece yüz binlerce dosyada tüm `Future` nesneleri belleğe yüklenmez.
 
-4. **Lazy UI Yükleme** — TreeView'e sadece grup başlıkları eklenir. Kullanıcı `▶` tıklayınca (`<<TreeviewOpen>>` event) o grubun dosyaları `os.stat()` ile yüklenir. 10.000+ dosyada bile anında açılır.
+4. **Grup Sıralaması** — Gruplar `boşluk_tasarrufu = (dosya_sayısı - 1) * dosya_boyutu` formülüyle **büyükten küçüğe** sıralanır. En üstte en çok yer kazandırıcı gruplar olur.
+
+5. **Lazy UI Yükleme** — TreeView'e sadece grup başlıkları eklenir. Kullanıcı `▶` tıklayınca (`<<TreeviewOpen>>` event) o grubun dosyaları `os.stat()` ile yüklenir. 10.000+ dosyada bile anında açılır.
 
 ---
 
@@ -470,10 +472,11 @@ python main.py
 ### 🏗️ Architecture
 
 1. **Size Pre-filter** — Single-pass `os.walk()`, group by size. Eliminates 90%+ files from hashing.
-2. **Parallel SHA-256** — Candidates processed via `ThreadPoolExecutor`, 64KB chunked reads.
-3. **Group & Sort** — Groups by `(size, hash)`, sorted by `space_saved = (count-1) * size` descending.
-4. **Lazy UI** — Only group headers in TreeView. Files loaded on-demand when expanding `▶`.
-5. **Safe Delete** — User confirmation → `os.remove()` → UI update.
+2. **Staged SHA-256** — First and last 64KB blocks are compared before full hashing; only matching samples advance to full reads.
+3. **Bounded Work Queue** — Pending hash jobs are capped at four times the worker count to keep memory usage stable.
+4. **Group & Sort** — Groups by `(size, hash)`, sorted by `space_saved = (count-1) * size` descending.
+5. **Lazy UI** — Only group headers in TreeView. Files loaded on-demand when expanding `▶`.
+6. **Safe Delete** — User confirmation → `os.remove()` → UI update.
 
 ---
 
