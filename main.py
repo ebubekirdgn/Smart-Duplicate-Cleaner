@@ -28,6 +28,7 @@ class DuplicateFinder:
         self.chunk_size = 65536
         self.current_group_id = 0
         self.group_items = {}
+        self.group_keep_paths = {}
 
         self._setup_styles()
         self._build_ui()
@@ -73,11 +74,10 @@ class DuplicateFinder:
         self.btn_stop = ttk.Button(btn_frame, text="⏹ Durdur", command=self._stop_scan, width=16, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=4)
 
-        self.btn_delete = ttk.Button(btn_frame, text="🗑 Seçilileri Sil", command=self._delete_selected, style="Danger.TButton", width=20, state=tk.DISABLED)
+        self.btn_delete = ttk.Button(btn_frame, text="🗑 Kopyaları Sil", command=self._delete_selected, style="Danger.TButton", width=20, state=tk.DISABLED)
         self.btn_delete.pack(side=tk.LEFT, padx=4)
 
-        ttk.Button(btn_frame, text="☑ Tümünü İşaretle", command=self._select_all_duplicates, width=18).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="☐ Temizle", command=self._clear_selection, width=14).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="☑ Her Grupta İlkini Tut", command=self._keep_first_in_groups, width=22).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text="📤 Dışa Aktar", command=self._export_results, width=16).pack(side=tk.LEFT, padx=4)
 
         # Auto-select frame
@@ -111,7 +111,7 @@ class DuplicateFinder:
         columns = ("keep", "name", "path", "size", "modified")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings", selectmode="extended")
         self.tree.heading("#0", text="Gruplar")
-        self.tree.heading("keep", text="✓")
+        self.tree.heading("keep", text="Tut")
         self.tree.heading("name", text="Dosya Adı")
         self.tree.heading("path", text="Yol")
         self.tree.heading("size", text="Boyut")
@@ -165,14 +165,14 @@ class DuplicateFinder:
         self.context_menu.add_command(label="📂 Konumu Aç", command=self._open_file_location)
         self.context_menu.add_command(label="📄 Özellikler", command=self._show_properties)
         self.context_menu.add_separator()
-        self.context_menu.add_command(label="☑ İşaretle", command=lambda: self._toggle_context_item(True))
-        self.context_menu.add_command(label="☐ İşaret Kaldır", command=lambda: self._toggle_context_item(False))
+        self.context_menu.add_command(label="☑ Bu Dosyayı Tut", command=lambda: self._toggle_context_item(True))
         self.tree.bind("<Button-3>", self._show_context_menu)
 
     def _show_context_menu(self, event):
         item = self.tree.identify_row(event.y)
         if item:
             self.tree.selection_set(item)
+            self.tree.focus(item)
             self.context_menu.post(event.x_root, event.y_root)
 
     def _toggle_context_item(self, check):
@@ -239,6 +239,7 @@ class DuplicateFinder:
             self.tree.delete(item)
         self.duplicates.clear()
         self.group_items.clear()
+        self.group_keep_paths.clear()
         self.current_group_id = 0
         self.scanned_count = 0
         self.total_files = 0
@@ -464,8 +465,9 @@ class DuplicateFinder:
 
             # Group header
             group_text = f"{len(paths)} dosya · {self._format_size(group_size)} each · Boşluk: {self._format_size(wasted)}"
-            group_item = self.tree.insert("", tk.END, iid=group_id, text=group_text, open=True, tags=("group",))
+            group_item = self.tree.insert("", tk.END, iid=group_id, text=group_text, open=False, tags=("group",))
             self.group_items[group_id] = paths
+            self.group_keep_paths[group_id] = paths[0]
 
             # Files in group (lazy loaded on expand)
             self.tree.insert(group_id, tk.END, iid=f"{group_id}_placeholder", text="Yükleniyor...")
@@ -475,7 +477,7 @@ class DuplicateFinder:
 
     def _on_group_expand(self, event):
         item = self.tree.focus()
-        if item.startswith("group_"):
+        if self._is_group_item(item):
             children = self.tree.get_children(item)
             if len(children) == 1 and children[0].endswith("_placeholder"):
                 self.tree.delete(children[0])
@@ -483,13 +485,14 @@ class DuplicateFinder:
 
     def _load_group_files(self, group_id):
         paths = self.group_items.get(group_id, [])
+        keep_path = self.group_keep_paths.get(group_id)
         for i, path in enumerate(paths):
             try:
                 stat = os.stat(path)
                 size_str = self._format_size(stat.st_size)
                 mod_str = self._format_time(stat.st_mtime)
                 name = os.path.basename(path)
-                keep = "☑" if i == 0 else "☐"
+                keep = "☑" if path == keep_path else "☐"
                 file_id = f"{group_id}_file_{i}"
                 self.tree.insert(group_id, tk.END, iid=file_id, text="", values=(keep, name, path, size_str, mod_str), tags=("file",))
             except OSError:
@@ -514,62 +517,59 @@ class DuplicateFinder:
             col = self.tree.identify_column(event.x)
             if col == "#1":
                 item = self.tree.identify_row(event.y)
-                if item and not item.startswith("group_"):
+                if self._is_file_item(item):
                     self._toggle_keep_item(item)
         elif region == "tree":
             item = self.tree.identify_row(event.y)
-            if item and item.startswith("group_"):
+            if self._is_group_item(item):
                 self._show_group_preview(item)
 
     def _toggle_keep(self, event):
         item = self.tree.focus()
-        if item and not item.startswith("group_"):
+        if self._is_file_item(item):
             self._toggle_keep_item(item)
 
     def _toggle_keep_item(self, item):
-        vals = list(self.tree.item(item, "values"))
+        vals = self.tree.item(item, "values")
         if vals:
-            vals[0] = "☐" if vals[0] == "☑" else "☑"
-            self.tree.item(item, values=vals)
+            self._set_group_keep(self.tree.parent(item), vals[2])
             self._show_file_preview(item)
 
     def _set_item_check(self, item, check):
-        if not item.startswith("group_"):
-            vals = list(self.tree.item(item, "values"))
+        if self._is_file_item(item) and check:
+            vals = self.tree.item(item, "values")
             if vals:
-                vals[0] = "☑" if check else "☐"
-                self.tree.item(item, values=vals)
+                self._set_group_keep(self.tree.parent(item), vals[2])
 
-    def _select_all_duplicates(self):
-        for item in self.tree.get_children():
-            self._check_all_in_group(item, True)
+    def _is_group_item(self, item):
+        return bool(item) and "group" in self.tree.item(item, "tags")
 
-    def _check_all_in_group(self, group_id, check):
+    def _is_file_item(self, item):
+        return bool(item) and "file" in self.tree.item(item, "tags")
+
+    def _set_group_keep(self, group_id, keep_path):
+        if keep_path not in self.group_items.get(group_id, []):
+            return
+        self.group_keep_paths[group_id] = keep_path
         for child in self.tree.get_children(group_id):
-            self._set_item_check(child, check)
+            if not self._is_file_item(child):
+                continue
+            vals = list(self.tree.item(child, "values"))
+            vals[0] = "☑" if vals[2] == keep_path else "☐"
+            self.tree.item(child, values=vals)
 
-    def _clear_selection(self):
-        for item in self.tree.get_children():
-            self._check_all_in_group(item, False)
+    def _keep_first_in_groups(self):
+        for group_id, paths in self.group_items.items():
+            if paths:
+                self._set_group_keep(group_id, paths[0])
 
     def _auto_select(self, mode):
-        for group_id in self.tree.get_children():
-            if not group_id.startswith("group_"):
-                continue
-            children = self.tree.get_children(group_id)
-            if not children:
-                continue
-
+        for group_id, paths in self.group_items.items():
             files_info = []
-            for child in children:
-                vals = self.tree.item(child, "values")
-                if not vals:
-                    continue
-                path = vals[2]
+            for path in paths:
                 try:
                     stat = os.stat(path)
                     files_info.append({
-                        "item": child,
                         "path": path,
                         "mtime": stat.st_mtime,
                         "path_len": len(path)
@@ -581,24 +581,23 @@ class DuplicateFinder:
                 continue
 
             if mode == "oldest":
-                keep_item = min(files_info, key=lambda x: x["mtime"])["item"]
+                keep_path = min(files_info, key=lambda x: x["mtime"])["path"]
             elif mode == "newest":
-                keep_item = max(files_info, key=lambda x: x["mtime"])["item"]
+                keep_path = max(files_info, key=lambda x: x["mtime"])["path"]
             elif mode == "shortest":
-                keep_item = min(files_info, key=lambda x: x["path_len"])["item"]
+                keep_path = min(files_info, key=lambda x: x["path_len"])["path"]
             elif mode == "same_folder":
                 group_path = os.path.dirname(files_info[0]["path"])
                 same_folder = [f for f in files_info if os.path.dirname(f["path"]) == group_path]
-                keep_item = same_folder[0]["item"] if same_folder else files_info[0]["item"]
+                keep_path = same_folder[0]["path"] if same_folder else files_info[0]["path"]
             else:
-                keep_item = files_info[0]["item"]
+                keep_path = files_info[0]["path"]
 
-            for f in files_info:
-                self._set_item_check(f["item"], f["item"] == keep_item)
+            self._set_group_keep(group_id, keep_path)
 
     def _on_double_click(self, event):
         item = self.tree.focus()
-        if item and not item.startswith("group_"):
+        if self._is_file_item(item):
             self._open_file_location()
 
     def _show_file_preview(self, item):
@@ -676,7 +675,7 @@ class DuplicateFinder:
 
     def _open_file_location(self):
         item = self.tree.focus()
-        if not item or item.startswith("group_"):
+        if not self._is_file_item(item):
             return
         vals = self.tree.item(item, "values")
         if not vals:
@@ -694,7 +693,7 @@ class DuplicateFinder:
 
     def _show_properties(self):
         item = self.tree.focus()
-        if not item or item.startswith("group_"):
+        if not self._is_file_item(item):
             return
         vals = self.tree.item(item, "values")
         if not vals:
@@ -713,70 +712,132 @@ class DuplicateFinder:
             messagebox.showerror("Hata", f"Özellikler alınamadı: {e}")
 
     def _delete_selected(self):
-        to_delete = []
-        for group_id in self.tree.get_children():
-            if not group_id.startswith("group_"):
+        delete_plan = []
+        for group_id, paths in self.group_items.items():
+            if len(paths) < 2:
                 continue
-            for child in self.tree.get_children(group_id):
-                vals = self.tree.item(child, "values")
-                if vals and vals[0] == "☑":
-                    to_delete.append((child, vals[2]))
+            keep_path = self.group_keep_paths.get(group_id)
+            if keep_path not in paths:
+                keep_path = paths[0]
+                self.group_keep_paths[group_id] = keep_path
+            delete_plan.append((group_id, keep_path, [path for path in paths if path != keep_path]))
 
-        if not to_delete:
-            messagebox.showinfo("Bilgi", "Silinecek dosya seçilmedi.")
+        delete_count = sum(len(paths) for _, _, paths in delete_plan)
+        if not delete_count:
+            messagebox.showinfo("Bilgi", "Silinecek kopya bulunamadı.")
             return
 
         confirm = messagebox.askyesno(
             "Onay",
-            f"{len(to_delete)} dosya kalıcı olarak silinecek.\nBu işlem GERİ ALINAMAZ. Devam etmek istiyor musunuz?",
+            f"{len(delete_plan)} gruptaki {delete_count} kopya kalıcı olarak silinecek.\n"
+            "Her grupta Tut sütununda işaretli bir dosya korunacak.\n"
+            "Bu işlem GERİ ALINAMAZ. Devam etmek istiyor musunuz?",
             icon="warning"
         )
         if not confirm:
             return
 
         deleted = 0
-        errors = 0
-        for item_id, path in to_delete:
-            try:
-                os.remove(path)
-                deleted += 1
-                self.tree.delete(item_id)
-            except Exception as e:
-                errors += 1
-                messagebox.showerror("Hata", f"Silinemedi: {path}\n{e}")
+        errors = []
+        changed = []
+        for group_id, keep_path, targets in delete_plan:
+            if not os.path.isfile(keep_path):
+                errors.append(f"Korunacak dosya bulunamadı: {keep_path}")
+                continue
 
-        # Remove empty groups
-        for group_id in self.tree.get_children():
-            if not self.tree.get_children(group_id):
-                self.tree.delete(group_id)
+            remaining_paths = [keep_path]
+            for path in targets:
+                if not os.path.lexists(path):
+                    self._remove_path_from_tree(group_id, path)
+                    continue
+                try:
+                    if not self._files_equal(keep_path, path):
+                        changed.append(path)
+                        self._remove_path_from_tree(group_id, path)
+                        continue
+                    os.remove(path)
+                    deleted += 1
+                    self._remove_path_from_tree(group_id, path)
+                except OSError as e:
+                    remaining_paths.append(path)
+                    errors.append(f"{path}: {e}")
 
-        messagebox.showinfo("Tamam", f"Silinen: {deleted}\nHata: {errors}")
+            if len(remaining_paths) == 1:
+                if self.tree.exists(group_id):
+                    self.tree.delete(group_id)
+                self.group_items.pop(group_id, None)
+                self.group_keep_paths.pop(group_id, None)
+            else:
+                self.group_items[group_id] = remaining_paths
+                self._update_group_header(group_id, remaining_paths)
+
+        self.btn_delete.config(state=tk.NORMAL if self.group_items else tk.DISABLED)
+        message = f"Silinen kopya: {deleted}\nKalan kopya grubu: {len(self.group_items)}"
+        if errors:
+            details = "\n".join(errors[:10])
+            if len(errors) > 10:
+                details += f"\n... ve {len(errors) - 10} hata daha"
+            if changed:
+                details += f"\n{len(changed)} dosya taramadan sonra değiştiği için silinmedi."
+            messagebox.showwarning("Kısmen Tamamlandı", f"{message}\n\n{details}")
+        elif changed:
+            messagebox.showwarning(
+                "Tamamlandı",
+                f"{message}\n\n{len(changed)} dosya taramadan sonra değiştiği için silinmedi."
+            )
+        else:
+            messagebox.showinfo("Tamam", message)
         self._update_stats_after_delete()
+
+    def _files_equal(self, first_path, second_path):
+        if os.path.getsize(first_path) != os.path.getsize(second_path):
+            return False
+        with open(first_path, "rb") as first, open(second_path, "rb") as second:
+            while True:
+                first_chunk = first.read(self.chunk_size)
+                second_chunk = second.read(self.chunk_size)
+                if first_chunk != second_chunk:
+                    return False
+                if not first_chunk:
+                    return True
+
+    def _remove_path_from_tree(self, group_id, path):
+        for child in self.tree.get_children(group_id):
+            if not self._is_file_item(child):
+                continue
+            vals = self.tree.item(child, "values")
+            if vals and vals[2] == path:
+                self.tree.delete(child)
+                return
+
+    def _update_group_header(self, group_id, paths):
+        try:
+            size = os.path.getsize(paths[0])
+        except OSError:
+            size = 0
+        wasted = size * (len(paths) - 1)
+        text = f"{len(paths)} dosya · {self._format_size(size)} each · Boşluk: {self._format_size(wasted)}"
+        self.tree.item(group_id, text=text)
 
     def _update_stats_after_delete(self):
         remaining = 0
         groups = 0
         dupe_count = 0
         wasted = 0
-        for group_id in self.tree.get_children():
-            if not group_id.startswith("group_"):
+        for paths in self.group_items.values():
+            if len(paths) < 2:
                 continue
             groups += 1
-            children = self.tree.get_children(group_id)
-            if len(children) > 1:
-                dupe_count += len(children) - 1
-                try:
-                    first = self.tree.item(children[0], "values")
-                    if first:
-                        size = os.path.getsize(first[2])
-                        wasted += size * (len(children) - 1)
-                except Exception:
-                    pass
-            remaining += len(children)
+            dupe_count += len(paths) - 1
+            remaining += len(paths)
+            try:
+                wasted += os.path.getsize(paths[0]) * (len(paths) - 1)
+            except OSError:
+                pass
         self.stats_var.set(f"Dosya: {remaining} | Kopya Grupları: {groups} | Toplam Kopya: {dupe_count} | Boşluk: {self._format_size(wasted)}")
 
     def _export_results(self):
-        if not self.duplicates:
+        if not self.group_items:
             messagebox.showinfo("Bilgi", "Dışa aktarılacak veri yok.")
             return
 
@@ -792,31 +853,40 @@ class DuplicateFinder:
                 with open(file_path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow(["Grup", "Dosya Adı", "Yol", "Boyut", "Değiştirilme", "Sakla"])
-                    for group_id in self.tree.get_children():
-                        if not group_id.startswith("group_"):
-                            continue
+                    for group_id, paths in self.group_items.items():
                         group_text = self.tree.item(group_id, "text")
-                        for child in self.tree.get_children(group_id):
-                            vals = self.tree.item(child, "values")
-                            if vals:
-                                writer.writerow([group_text, vals[1], vals[2], vals[3], vals[4], vals[0]])
+                        keep_path = self.group_keep_paths.get(group_id)
+                        for path in paths:
+                            try:
+                                stat = os.stat(path)
+                            except OSError:
+                                continue
+                            writer.writerow([
+                                group_text,
+                                os.path.basename(path),
+                                path,
+                                self._format_size(stat.st_size),
+                                self._format_time(stat.st_mtime),
+                                "☑" if path == keep_path else "☐"
+                            ])
             else:
                 data = []
-                for group_id in self.tree.get_children():
-                    if not group_id.startswith("group_"):
-                        continue
+                for group_id, paths in self.group_items.items():
                     group_text = self.tree.item(group_id, "text")
                     files = []
-                    for child in self.tree.get_children(group_id):
-                        vals = self.tree.item(child, "values")
-                        if vals:
-                            files.append({
-                                "name": vals[1],
-                                "path": vals[2],
-                                "size": vals[3],
-                                "modified": vals[4],
-                                "keep": vals[0] == "☑"
-                            })
+                    keep_path = self.group_keep_paths.get(group_id)
+                    for path in paths:
+                        try:
+                            stat = os.stat(path)
+                        except OSError:
+                            continue
+                        files.append({
+                            "name": os.path.basename(path),
+                            "path": path,
+                            "size": self._format_size(stat.st_size),
+                            "modified": self._format_time(stat.st_mtime),
+                            "keep": path == keep_path
+                        })
                     data.append({"group": group_text, "files": files})
                 with open(file_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)

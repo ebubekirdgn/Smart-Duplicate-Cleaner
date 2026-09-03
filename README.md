@@ -102,7 +102,7 @@ pause
 ```
 - **▶ / ▼** ile grup aç/kapa (lazy loading - anında)
 - Dosyaya tıkla → **sağ panelde önizleme görünür**
-- **☑ / ☐** ile tek tek işaretle
+- **Tut** sütunundan her grupta korunacak dosyayı seçin
 
 #### 4️⃣ Otomatik Seçim (Önerilen)
 | Buton | Ne Zaman Kullanılmalı? |
@@ -113,7 +113,9 @@ pause
 | 📂 **Aynı Klasörde Tut** | Dağınık yedekleri temizleyip ana kopyayı korumak için |
 
 #### 5️⃣ Silme İşlemi
-- **🗑 Seçilileri Sil** → **Evet** onayı → İşlem tamam
+- Her grupta **Tut** sütununda işaretli dosya korunur
+- **🗑 Kopyaları Sil** → **Evet** onayı → Diğer aynı içerikli dosyalar silinir
+- Silmeden hemen önce dosya içerikleri yeniden karşılaştırılır
 - Silinen dosyalar listeden kalkar
 - Boş gruplar otomatik temizlenir
 - İstatistikler güncellenir
@@ -130,7 +132,6 @@ pause
 |-----|-------|
 | `Space` | Seçili dosyanın ☑/☐ işaretini değiştir |
 | `Enter` | Seçili grupu aç/kapa |
-| `Ctrl+A` | Tüm dosyaları işaretle (gruplar içinde) |
 | `Delete` | Seçili dosyaları sil (onay ister) |
 | `F5` | Tarama yenile (tekrar başlat) |
 | `Esc` | Tarama durdur / Seçimi temizle |
